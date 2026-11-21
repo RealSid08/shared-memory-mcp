@@ -1,6 +1,6 @@
-Codex Shared Memory
+Shared Memory MCP (formerly Codex Shared Memory)
 Copyright 2026 Sidhaarth Krishnan
 
-This project implements a compatibility surface evaluated against the OpenAI Codex memory extension. It is an independent community project and is not affiliated with or endorsed by OpenAI.
+This is an independent community project and is not affiliated with or endorsed by Anthropic, OpenAI, Google, or Anysphere.
 
-OpenAI and Codex are trademarks of their respective owner. No trademark rights are granted by the Apache License 2.0.
+Claude, OpenAI, Codex, Antigravity, OpenCode, and Cursor are trademarks of their respective owners. No trademark rights are granted by the Apache License 2.0.

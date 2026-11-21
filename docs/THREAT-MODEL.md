@@ -2,37 +2,33 @@
 
 ## Intended use
 
-One person operates the server and enrolls only trusted machines. The service shares concise Markdown reference data over local stdio or authenticated SSH. The server is not exposed as a public HTTP service.
+One person operates the server and enrolls only trusted machines. The service shares concise, curated Markdown memories over local stdio or authenticated SSH. The server is not exposed as a public HTTP service.
 
 ## Trust boundaries
 
-- SSH authenticates transport peers and protects traffic in transit.
-- Every enrolled SSH identity has the same effective read access to all shared memory.
-- The MCP client and model can call every exposed tool. Client-side confirmation and policy remain important for the write tool.
-- Native memory files are untrusted reference content, not executable instructions.
+- SSH authenticates transport peers and encrypts traffic in transit.
+- Every enrolled SSH identity has full read, write (`save`), and delete (`forget`) access to the shared memory store.
+- Any connected MCP client and model can call all four tools (`recall`, `read`, `save`, `forget`).
+- Stored memories are reference content, not executable instructions; agents should treat retrieved text as untrusted data and verify consequential facts against the live repo or system.
 
 ## Safeguards
 
-- Per-source allowlists enforced on both client and server, plus visible relative-path validation
-- Sources are opt-in per client; Claude Code memories are published only from `memory/*.md` files
-- Symlink refusal for source roots, source files, cache parents, and store roots
-- Per-file, per-machine, total-store, file-count, and wire-size quotas
-- Best-effort redaction of common tokens, private keys, and credential-assignment lines
-- Rejection of suspicious explicit notes instead of silent modification
-- SQLite transactions for snapshot isolation and append-only uniqueness
-- Optional required-mount guard and configurable minimum free space
-- Private file creation through a process umask and database mode enforcement
-- No offline write queue and no agent-facing delete capability
+- Strict schema validation for scopes, slugs, memory types, single-line names/descriptions, and UTF-8 bodies
+- Hard quotas enforced inside SQLite write transactions: 8 KiB per body, 200 memories per scope, 2,000 memories total, 16 MiB store cap, 32 MiB wire cap
+- Best-effort secret filter that rejects private key blocks, common API tokens, and credential assignment lines on `save` and `import` (fails closed rather than silently rewriting)
+- Symlink refusal for install roots, store roots, cache directories, and cache file targets
+- Optional required-mount guard and configurable minimum free-space threshold before writes
+- Private file creation (`umask 0077`) and `0600` permissions on SQLite database files
+- Destructive tool annotation (`destructiveHint: true`) on `forget`, and `readOnlyHint: true` on `recall` and `read`
+- No offline write queue (failed writes fail explicitly instead of replaying stale mutations later)
 
 ## Important limitations
 
-- Secret detection can miss credentials written in prose or an unfamiliar format.
-- A compromised enrolled client or SSH identity can read all shared content and add notes.
-- This is not multi-tenant. It has no per-machine read policy or per-note authorization.
-- SSH server configuration, key lifecycle, operating-system security, full-disk encryption, and off-device backups are outside this repository.
-- Cache refresh is atomic per file, not across the entire directory.
-- The cache-backed MCP server reads whatever is in the local cache directory; protect it like the rest of the user's home directory.
-- SQLite backups on the same disk do not protect against disk loss.
-- Generated memory can contain sensitive personal or project facts even when it contains no credential.
+- Secret detection is best-effort and can miss credentials written in prose or unusual formats. Store pointers to where credentials live, never the credentials themselves.
+- A compromised enrolled client or SSH key can read, overwrite, or delete all shared memories.
+- This is not multi-tenant. There are no per-user ACLs, per-scope permissions, or cryptographic audit logs.
+- SSH hardening, key rotation, disk encryption, and off-device backups are outside this repository.
+- Local cache files (`cache/memories.json` and Markdown mirror) live unencrypted in the user's home directory; protect the machine accordingly.
+- SQLite backups on the same disk do not protect against hardware failure.
 
-Do not expose the stdio process through an unauthenticated network wrapper. If multiple untrusted users or organizations need access, use a different architecture with explicit identity, authorization, audit, retention, and deletion controls.
+Do not expose the stdio process through an unauthenticated network wrapper. If multiple untrusted users or teams need shared memory, use a multi-tenant service with explicit authentication, authorization, and audit controls.

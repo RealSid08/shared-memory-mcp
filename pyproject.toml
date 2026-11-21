@@ -1,18 +1,18 @@
 [project]
-name = "codex-shared-memory"
-version = "2.0.0"
-description = "A private, self-hosted MCP service for sharing agent memory across machines and harnesses"
+name = "shared-memory-mcp"
+version = "3.0.0"
+description = "Curated, harness-agnostic shared memory MCP across machines (Claude-style typed topics)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Sidhaarth Krishnan", email = "krishnansidhaarth@gmail.com" }]
-keywords = ["codex", "claude-code", "opencode", "cursor", "mcp", "memory", "self-hosted"]
+keywords = ["mcp", "memory", "claude-code", "codex", "antigravity", "opencode", "cursor", "self-hosted"]
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/RealSid08/codex-shared-memory"
-Repository = "https://github.com/RealSid08/codex-shared-memory"
-Issues = "https://github.com/RealSid08/codex-shared-memory/issues"
+Homepage = "https://github.com/RealSid08/shared-memory-mcp"
+Repository = "https://github.com/RealSid08/shared-memory-mcp"
+Issues = "https://github.com/RealSid08/shared-memory-mcp/issues"
 
 [dependency-groups]
 dev = ["ruff>=0.16,<0.17"]

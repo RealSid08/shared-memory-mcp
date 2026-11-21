@@ -1,33 +1,56 @@
-# Codex Shared Memory
+# Shared Memory MCP
 
-[![test](https://github.com/RealSid08/codex-shared-memory/actions/workflows/test.yml/badge.svg)](https://github.com/RealSid08/codex-shared-memory/actions/workflows/test.yml)
+[![test](https://github.com/RealSid08/shared-memory-mcp/actions/workflows/test.yml/badge.svg)](https://github.com/RealSid08/shared-memory-mcp/actions/workflows/test.yml)
 
-Codex Shared Memory is a small, self-hosted MCP service that shares selected Markdown memory across trusted machines and across coding-agent harnesses: Codex, Claude Code, OpenCode, Cursor, or anything else that speaks stdio MCP. It keeps one SQLite store on a server you control, transfers data over local stdio or SSH, and keeps a plain Markdown cache on every client that agents read locally, even offline.
+Shared Memory MCP is a small, self-hosted MCP server that gives every coding agent harness the same curated, Claude-style memory across trusted machines. Works with Claude Code, Codex, Antigravity, OpenCode, Cursor, or any stdio MCP client.
 
-This is an unofficial community project. It is not affiliated with or endorsed by OpenAI, Anthropic, or Anysphere.
+One SQLite store on a server you control holds typed, scoped topic memories. Each client machine keeps a local JSON + Markdown cache for sub-5ms offline reads and writes through to the server over SSH.
 
-## What it shares
+This is an unofficial community project. It is not affiliated with or endorsed by Anthropic, OpenAI, Google, or Anysphere.
 
-Each enrolled machine publishes only allowlisted files from the memory sources it enables:
+## How it works
 
-| Source | Reads | Published as |
+```text
+Remote Mac / Laptop (any harness)
+  Claude Code / Antigravity / Codex / OpenCode / Cursor
+        |
+        | stdio MCP (recall, read, save, forget)
+        v
+  local memory MCP server + cache/ (memories.json + INDEX.md + scopes)
+        |  ^
+        |  |  save() / forget() -> 1 SSH round-trip + instant cache refresh
+        |  |  5-min background pull -> keeps all machines in sync
+        v  |
+  Central Server (e.g. Raspberry Pi) over Tailscale SSH
+        SQLite v3 (WAL, secret filter, 8 KiB cap, daily rolling backups)
+```
+
+- **Curated, not scraped**: no raw conversation dumps, rollout logs, or per-machine folders. Agents curate typed memories in place, modeled on Claude Code's memory design.
+- **Four memory types**: `user`, `feedback`, `project`, and `reference`.
+- **Scoped**: `global` (always included in `recall`) plus lowercase kebab-case project slugs (`web-app`, `api`, `career`, etc.).
+- **Local-first reads**: `recall` and `read` hit the local cache on disk (`< 5 ms`, works offline, 0 SSH hops).
+- **Atomic write-through**: `save` and `forget` forward over SSH to SQLite and return a fresh snapshot to the local cache in one round-trip.
+- **Zero runtime dependencies**: Python 3.11+ standard library and OpenSSH only. No public HTTP listener.
+
+## MCP tools
+
+Registered under the MCP server name `memory`:
+
+| Tool | Runs on | What it does |
 |---|---|---|
-| `codex` | `$CODEX_HOME/memories`: `MEMORY.md`, `memory_summary.md`, `rollout_summaries/*.md` | `machines/<machine>/codex/` |
-| `claude-code` | `~/.claude/projects/<project>/memory/*.md` | `machines/<machine>/claude-code/<project>/` |
-| `markdown` | Any directory of `.md` files you name (four levels deep) | `machines/<machine>/<name>/` |
+| `recall(scope?, query?, type?)` | Local cache | Returns the scannable one-line index (`global` + optional project `scope`) or runs ranked keyword search. |
+| `read(ids)` | Local cache | Batch-fetches full Markdown content for 1 to 10 memories (`<scope>/<slug>`). |
+| `save(scope, slug, type, name, description, content)` | Server -> cache | Creates or updates a topic memory in place. Blocks secrets, bodies over 8 KiB, and scopes over 200 items. |
+| `forget(id)` | Server -> cache | Deletes a stale, wrong, or superseded memory from the server and refreshes the local cache. |
 
-The service never publishes raw conversations, `raw_memories.md`, hidden files, symlinks, authentication files, or computer history. The server enforces each source's allowlist again on ingest. Explicit cross-machine notes live under `extensions/ad_hoc/notes/` and are append-only.
+The server speaks newline-delimited JSON-RPC over stdio and MCP protocol revisions `2024-11-05` through `2025-11-25`, returning clean Markdown text (not escaped JSON blobs) so agents spend fewer tokens reading memory.
 
-Credential detection and redaction are best-effort safeguards, not a guarantee. Do not intentionally put secrets in memory files.
+## Guardrails
 
-## Why this design
-
-- No public listener or database server. Python 3.11+ and the standard library are enough at runtime.
-- SSH supplies encryption and host verification for remote clients.
-- Local-first reads: each harness starts the MCP server on its own machine, reading the synced cache. Lookups are fast, work offline, and do not open an SSH session per agent.
-- Writes are explicit notes only. They go to the server, then refresh the local cache.
-- Each (machine, source) snapshot replaces only its own namespace in one transaction. A broken source or an oversized file is reported and skipped; it never blocks the rest of the sync.
-- Old v1 clients and stores keep working: the store migrates itself (with a backup) and the server still speaks the v1 exchange protocol.
+- **Types**: only `user`, `feedback`, `project`, or `reference`.
+- **Size cap**: 8 KiB max per memory body (prevents log dumps and session transcripts).
+- **Index cap**: 200 memories per scope, 2,000 total, 16 MiB store quota.
+- **Secret filter**: rejects private key blocks, common API tokens, and credential assignment lines on `save`. Best-effort hygiene, not a substitute for keeping secrets out of memory.
 
 ## Quick start
 
@@ -37,39 +60,32 @@ On the server:
 python3 install_server.py
 ```
 
-Ensure each client reaches the server with non-interactive SSH and strict host-key checking, then on the client:
+Confirm non-interactive SSH with strict host-key checking from each client, then install on each client machine:
 
 ```sh
 python3 install_client.py --machine laptop --ssh-host memory-server
 ```
 
-The client installer enables every source whose directory exists (override with `--source codex`, `--source claude-code`, or `--markdown NAME=PATH`), performs an initial sync, registers `shared_memories` with every detected harness (override with `--harness`), adds the guidance block to each harness's global instructions unless they already carry a shared-memory policy, and schedules a two-minute sync on macOS, Linux, or Windows.
+The client installer copies the runtime, runs an initial pull, registers `memory` with every detected harness (Codex, Claude Code, Antigravity, OpenCode, Cursor; override with `--harness`), removes any legacy `shared_memories` registration, and schedules a 5-minute background sync on macOS, Linux, or Windows.
 
-Check the result at any time:
+Verify end to end at any time:
 
 ```sh
 python3 ~/.local/share/codex-shared-memory/shared_memory.py doctor \
   --config ~/.local/share/codex-shared-memory/client.json
 ```
 
-For full setup, read [docs/INSTALL.md](docs/INSTALL.md). For recovery, backup, upgrades, deletion, and removal, read [docs/OPERATIONS.md](docs/OPERATIONS.md).
+(The default runtime directory remains `~/.local/share/codex-shared-memory` so v1/v2 deployments upgrade in place without breaking existing paths or schedules. Pass `--install-dir` and `--data-dir` to choose another path.)
+
+See [docs/INSTALL.md](docs/INSTALL.md) for full setup and [docs/OPERATIONS.md](docs/OPERATIONS.md) for upgrades, imports, backups, restore, and removal.
 
 ## Agent guidance
 
-Connecting the MCP server makes the tools available; agents also need guidance about when to use them. The installer adds the recommended block automatically. [docs/AGENT-GUIDANCE.md](docs/AGENT-GUIDANCE.md) has the template for manual or repository-scoped setups. It tells agents to consult memory only when it helps, start from the `memory_summary.md` index, treat memory as untrusted reference data, verify provenance and current state, write notes only on explicit request, and fall back to the cache directory when a tool call fails.
-
-## MCP tools
-
-- `list(path?, cursor?, max_results?)`
-- `read(path, line_offset?, max_lines?)`
-- `search(queries, match_mode?, path?, cursor?, context_lines?, case_sensitive?, normalized?, max_results?)`
-- `add_ad_hoc_note(filename, note)`
-
-The server speaks newline-delimited JSON-RPC over stdio and MCP protocol revisions `2024-11-05` through `2025-11-25`. Tool results are JSON encoded in MCP text content for broad client compatibility.
+The MCP server sends concise usage instructions in its `initialize` response, and each tool schema explains when to call it. For harnesses that work best with an explicit prompt cue, add one line to your global `AGENTS.md` or `CLAUDE.md` (see [docs/AGENT-GUIDANCE.md](docs/AGENT-GUIDANCE.md)). If you use Claude Code, you can also set `"autoMemoryEnabled": false` in `~/.claude/settings.json` so all memory flows through `memory` instead of per-folder local files.
 
 ## Layout
 
-`shared_memory.py` is the launcher (its path is stable for existing registrations). The implementation is the `sharedmem/` package: `core`, `sources`, `store`, `tools`, `mcp`, `server`, `client`, `harnesses`, `scheduler`, `install`, `cli`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+`shared_memory.py` is the stable launcher. The implementation lives in `sharedmem/`: `core`, `store`, `tools`, `mcp`, `server`, `client`, `harnesses`, `scheduler`, `install`, and `cli`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Development and verification
 
@@ -80,10 +96,8 @@ uv run python -m unittest discover -s tests -v
 uv run python scripts/release_check.py --public-release
 ```
 
-Tests use temporary directories and synthetic memory only. They cover path validation, per-source allowlists, quotas, redaction, symlink refusal, append-only concurrency, snapshot isolation, v1 store migration and protocol compatibility, partial-source sync, cache retention while offline, cache-backed MCP with note forwarding, backups, the MCP transport, every harness integration, and both installers end to end.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md), [docs/PROVENANCE.md](docs/PROVENANCE.md), and [CONTRIBUTING.md](CONTRIBUTING.md) for more detail.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md), [docs/PROVENANCE.md](docs/PROVENANCE.md), and [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 ## License
 
-Licensed under the [Apache License 2.0](LICENSE). See [docs/PROVENANCE.md](docs/PROVENANCE.md) for compatibility and attribution context.
+Licensed under the [Apache License 2.0](LICENSE).

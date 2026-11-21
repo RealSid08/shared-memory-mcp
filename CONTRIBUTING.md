@@ -8,9 +8,9 @@ Before opening a change:
 uv sync --locked
 uv run ruff check .
 uv run python -m unittest discover -s tests -v
-uv run python scripts/release_check.py
+uv run python scripts/release_check.py --public-release
 ```
 
 Tests must use synthetic content and temporary directories. Never attach a real memory snapshot, runtime configuration, database, cache, SSH log, home-directory path, tailnet address, host key, token, or credential to an issue or pull request.
 
-Security reports should not be filed publicly until a private reporting channel is chosen. See `SECURITY.md`.
+Report security issues privately using [GitHub private vulnerability reporting](https://github.com/RealSid08/shared-memory-mcp/security/advisories/new). See `SECURITY.md`.

@@ -2,78 +2,81 @@
 
 ## Health checks
 
-On the server, use the exact script and data paths printed by `install_server.py`:
+On the server:
 
 ```sh
 python3 ~/.local/share/codex-shared-memory/shared_memory.py status \
   --data ~/.local/share/codex-shared-memory/data
 ```
 
-The result reports SQLite integrity, enrolled machine IDs with last successful sync timestamps, file count, and free bytes.
+This reports schema version (`3`), SQLite `integrity_check`, total memories, stored body bytes, per-scope counts, and disk free space.
 
-On a client, run the configured sync command or:
+On a client, pull immediately or run `doctor`:
 
 ```sh
 python3 ~/.local/share/codex-shared-memory/shared_memory.py sync \
   --config ~/.local/share/codex-shared-memory/client.json
-```
 
-Inspect `status.json` in the configured cache for the last success, per-source results, skipped files, and source errors. A failed sync preserves the existing cache and writes `error.json`; the next success removes the error file.
-
-For an end-to-end check of sources, server, cache freshness, and every harness registration:
-
-```sh
 python3 ~/.local/share/codex-shared-memory/shared_memory.py doctor \
   --config ~/.local/share/codex-shared-memory/client.json
 ```
 
-## Upgrade from 1.x
+Inspect `<cache>/status.json` for `last_success`, `total_memories`, and `scopes`. A failed sync leaves the existing cache intact and writes `<cache>/error.json`; the next successful sync removes `error.json`.
 
-1. Upgrade the server first: rerun `install_server.py` from the new checkout. The first command that opens the store writes `<data>/backups/pre-v2-migration.sqlite3` and migrates it in place; `status` then reports `"schema": 2`.
-2. Unupgraded 1.x clients keep syncing. Their snapshots land under `machines/<machine>/codex/`, and their responses omit files over 512 KiB.
-3. Rerun `install_client.py` on each client. It switches the harnesses to the local cache-backed `serve --config` command, enables detected sources, and keeps the same schedule names.
+## Bulk import
+
+Seed or migrate curated memories from a JSON array (`[{scope, slug, type, name, description, content, updated_at?, updated_by?}, ...]`) via stdin on the server:
+
+```sh
+python3 ~/.local/share/codex-shared-memory/shared_memory.py import \
+  --data ~/.local/share/codex-shared-memory/data < curated.json
+```
+
+Pass `--replace` to replace the store contents atomically. All validation rules (types, 8 KiB body cap, scope caps, secret rejection) run before the transaction commits.
+
+## Upgrade from 1.x or 2.x
+
+1. Upgrade the server first: rerun `install_server.py` from this checkout. Opening a v1/v2 database automatically writes `<data>/backups/pre-v3-migration.sqlite3` before migrating to schema v3 and vacuuming the file.
+2. Seed any curated memories you want to preserve with `import` (or let agents save fresh ones).
+3. Rerun `install_client.py` on each client machine. It updates `client.json` to v3, pulls the curated snapshot, switches harness registrations from `shared_memories` to `memory`, and updates the background sync schedule in place.
 
 ## Backups
 
-Run a backup manually with the same data, mount, and free-space options as the server installation:
+Run a manual backup on the server:
 
 ```sh
 python3 ~/.local/share/codex-shared-memory/shared_memory.py backup \
   --data ~/.local/share/codex-shared-memory/data
 ```
 
-Backups are integrity-checked SQLite copies under `<data>/backups/`. The service retains three dated recovery points. They are on the same storage device by default, so copy verified backups elsewhere if device failure is in scope.
+Backups use SQLite's online backup API, run `PRAGMA integrity_check` on the copy, and keep three rolling daily snapshots under `<data>/backups/`. Copy backups off-device if disk failure is in scope.
 
 ## Restore
 
-1. Stop client sync schedules and close clients using this MCP.
-2. Stop the server backup schedule.
-3. Preserve the current database together with any WAL and SHM files for diagnosis.
-4. Restore a verified backup as `memory.sqlite3` with user-only permissions.
-5. Do not leave stale WAL or SHM files beside the restored database.
-6. Run `status`, then re-enable schedules and clients.
-7. Let each machine republish its current native snapshot.
+1. Pause client sync schedules and close active agent sessions using `memory`.
+2. Pause the server backup schedule.
+3. Preserve the current `memory.sqlite3` (and any `-wal` / `-shm` files) for inspection.
+4. Copy a verified backup to `memory.sqlite3` with `0600` permissions and remove any stale `-wal` / `-shm` files.
+5. Run `status`, re-enable schedules, and trigger a client `sync`.
 
-## Forget and delete
+## Deleting memories
 
-Append-only notes support corrections, not secure erasure. An actual deletion requires administrative work:
+For normal cleanup, agents or users can call `forget("<scope>/<slug>")`, which deletes the row in SQLite and prunes the local Markdown mirror on every machine at the next sync.
 
-1. Stop sync and MCP use.
-2. Remove the fact from every originating native memory through the source product's supported controls.
-3. Delete the corresponding canonical SQLite rows or rebuild the store from reviewed snapshots.
-4. Remove affected backups and every client cache.
-5. Resume sync and verify that the content does not return.
+If you need complete historical erasure (for example, after an accidental sensitive paste):
 
-The MCP intentionally exposes no delete tool. A correction note does not erase older content.
+1. Call `forget("<scope>/<slug>")` (or delete the row in SQLite and run `VACUUM`).
+2. Delete any dated backups under `<data>/backups/` that predated the removal and run a fresh `backup`.
+3. Run `sync` on every enrolled client so local `memories.json` and Markdown files are refreshed.
 
 ## Disconnect a client
 
-1. Disable its schedule.
-2. Remove the `shared_memories` MCP entry from the client.
-3. Remove the marked shared-memory block from `AGENTS.md` or equivalent client instructions.
-4. Keep or remove the local cache and runtime configuration according to your retention needs.
+1. Disable its OS sync schedule.
+2. Remove the `memory` MCP server from each harness.
+3. Remove any shared-memory cue from your global `AGENTS.md` / `CLAUDE.md`.
+4. Delete `~/.local/share/codex-shared-memory` (or your custom `--install-dir`).
 
-Common schedule identifiers are:
+Default OS schedule identifiers (kept stable from v1 for in-place upgrades):
 
 - macOS client: `codex-shared-memory.sync`
 - macOS server backup: `codex-shared-memory.backup`

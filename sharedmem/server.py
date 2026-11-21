@@ -1,64 +1,67 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exchange protocol handler run on the server (locally or over SSH).
+"""Exchange protocol v3 handler run on the server (locally or over SSH).
 
 Requests arrive as one JSON object on stdin:
-
-- v1 (legacy clients): {"machine", "files"} -> stored as the machine's codex source
-- v2 sync: {"protocol": 2, "op": "sync", "machine",
-            "sources": {name: {"type", "files"}}}
-- v2 note: {"protocol": 2, "op": "note", "filename", "note"}
-
-Sync responses always include {"ingest", "files"} so v1 clients keep working. v1
-clients reject any response file over their 512 KiB limit, so their view omits those.
+- {"protocol": 3, "op": "pull"} -> full curated memories list
+- {"protocol": 3, "op": "save", "memory": {...}} -> upsert + updated memories list
+- {"protocol": 3, "op": "forget", "id": "<scope>/<slug>"} -> delete + updated list
+- {"protocol": 3, "op": "import", "items": [...], "replace": bool} -> bulk import
+- {"protocol": 3, "op": "status"} -> store health and scope counts
 """
 
-import re
-
 from . import VERSION
-from .core import MACHINE_RE
-
-V1_MAX_FILE = 512 * 1024
 
 
 def handle(store, request):
     if not isinstance(request, dict):
         raise TypeError("Exchange request must be a JSON object")
-    protocol = request.get("protocol", 1)
-    op = request.get("op", "sync")
-    if protocol == 1:
-        ingest = store.ingest(request["machine"], request["files"])
-        files = {
-            path: content
-            for path, content in store.all_files().items()
-            if len(content.encode("utf-8")) <= V1_MAX_FILE
+    protocol = request.get("protocol")
+    if protocol != 3:
+        raise ValueError(f"Unsupported exchange protocol {protocol}; expected 3")
+    op = request.get("op")
+    if op == "status":
+        return {"protocol": 3, "server_version": VERSION, **store.status()}
+    if op == "pull":
+        return {
+            "protocol": 3,
+            "server_version": VERSION,
+            "memories": store.all_memories(),
         }
-        return {"ingest": ingest, "files": files}
-    if protocol != 2:
-        raise ValueError(f"Unsupported exchange protocol {protocol}")
-    if op == "note":
-        store.add_note(request["filename"], request["note"])
-        return {"protocol": 2, "server_version": VERSION, "note": "created"}
-    if op != "sync":
-        raise ValueError(f"Unknown exchange operation {op}")
-    sources = request["sources"]
-    if not isinstance(sources, dict):
-        raise TypeError("sources must be an object")
-    if sources:
-        ingest = store.ingest_many(
-            request["machine"],
-            {name: (spec["type"], spec["files"]) for name, spec in sources.items()},
+    if op == "save":
+        mem = request.get("memory")
+        if not isinstance(mem, dict):
+            raise TypeError("memory must be an object")
+        result = store.save_memory(
+            scope=mem["scope"],
+            slug=mem["slug"],
+            type=mem["type"],
+            name=mem["name"],
+            description=mem["description"],
+            content=mem["content"],
+            updated_by=mem.get("updated_by") or request.get("machine") or "",
         )
-    else:  # every local source failed: still return the shared view
-        if not re.fullmatch(MACHINE_RE, str(request["machine"])):
-            raise ValueError("Invalid machine ID")
-        ingest = {"machine": request["machine"], "sources": {}}
-    removed = []
-    if "enabled" in request:
-        removed = store.prune(request["machine"], request["enabled"])
-    return {
-        "protocol": 2,
-        "server_version": VERSION,
-        "ingest": ingest,
-        "removed_sources": removed,
-        "files": store.all_files(),
-    }
+        return {
+            "protocol": 3,
+            "server_version": VERSION,
+            "result": result,
+            "memories": store.all_memories(),
+        }
+    if op == "forget":
+        result = store.delete_memory(request["id"])
+        return {
+            "protocol": 3,
+            "server_version": VERSION,
+            "result": result,
+            "memories": store.all_memories(),
+        }
+    if op == "import":
+        result = store.import_memories(
+            request.get("items", []), replace=bool(request.get("replace", False))
+        )
+        return {
+            "protocol": 3,
+            "server_version": VERSION,
+            "result": result,
+            "memories": store.all_memories(),
+        }
+    raise ValueError(f"Unknown exchange operation: {op}")

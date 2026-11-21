@@ -16,10 +16,8 @@ from .core import (
     DEFAULT_DATA,
     DEFAULT_MIN_FREE_BYTES,
     MACHINE_RE,
-    SOURCE_RE,
     atomic_write,
 )
-from .sources import DEFAULT_PATHS
 
 DEFAULT_INSTALL = "~/.local/share/codex-shared-memory"
 DEFAULT_REMOTE_SCRIPT = "~/.local/share/codex-shared-memory/shared_memory.py"
@@ -29,9 +27,7 @@ LAUNCHER = PACKAGE.parent / "shared_memory.py"
 
 
 def interpreter():
-    """The Python path as invoked, not resolved: a stable link such as uv's
-    cpython-3.11-* or Homebrew's opt/python@3.x keeps working across patch upgrades,
-    while the resolved versioned path disappears with the old version."""
+    """Keep the invoked Python path (e.g. Homebrew opt/ or uv symlink) stable."""
     return os.path.abspath(sys.executable)
 
 
@@ -40,7 +36,6 @@ def run(command, **kwargs):
 
 
 def copy_runtime(install_dir):
-    """Copy the launcher and package into install_dir; return the launcher path."""
     install_dir = Path(install_dir).expanduser()
     if install_dir.is_symlink():
         raise SystemExit("Refusing symlink install directory")
@@ -59,7 +54,6 @@ def copy_runtime(install_dir):
 
 
 def remote_arg(value):
-    """Quote one remote-shell argument while allowing a leading ~/ to expand."""
     if value.startswith("~/"):
         return '"$HOME"/' + shlex.quote(value[2:])
     return shlex.quote(value)
@@ -77,7 +71,6 @@ def server_options(data, require_mount, min_free_bytes):
 
 
 def build_commands(args, python, installed_script):
-    """Return (exchange_command, remote_serve_command)."""
     if args.local_data:
         prefix = [python, str(installed_script)]
         options = server_options(
@@ -113,37 +106,8 @@ def build_commands(args, python, installed_script):
     return ssh_prefix + [exchange], ssh_prefix + [serve]
 
 
-def resolve_sources(args, home):
-    """Build the sources map from --source/--markdown, defaulting to detected ones."""
-    defaults = {
-        "codex": Path(args.native_memory or Path(args.codex_home) / "memories"),
-        "claude-code": home / ".claude/projects",
-    }
-    defaults = {name: Path(str(p)).expanduser() for name, p in defaults.items()}
-    requested = args.source or [name for name, p in defaults.items() if p.is_dir()]
-    sources = {}
-    for item in requested:
-        name, _, path = item.partition("=")
-        if name not in DEFAULT_PATHS:
-            raise SystemExit(f"Unknown source {name}; use --markdown NAME=PATH")
-        root = Path(path).expanduser() if path else defaults[name]
-        sources[name] = {"type": name, "path": str(root)}
-    for item in args.markdown or []:
-        name, _, path = item.partition("=")
-        if not re.fullmatch(SOURCE_RE, name) or not path or name in DEFAULT_PATHS:
-            raise SystemExit("--markdown expects NAME=PATH with a new lowercase NAME")
-        sources[name] = {"type": "markdown", "path": str(Path(path).expanduser())}
-    if not sources:
-        raise SystemExit("No memory sources found; pass --source or --markdown")
-    for name, spec in sources.items():
-        root = Path(spec["path"])
-        if not root.is_dir() or root.is_symlink():
-            raise SystemExit(f"Source {name} directory is missing or symlinked: {root}")
-    return sources
-
-
 def client_parser():
-    parser = argparse.ArgumentParser(description="Install a shared-memory client.")
+    parser = argparse.ArgumentParser(description="Install a curated shared-memory client.")
     parser.add_argument("--machine", required=True, help="stable lowercase machine ID")
     location = parser.add_mutually_exclusive_group(required=True)
     location.add_argument("--ssh-host", help="OpenSSH host or alias for the server")
@@ -156,40 +120,27 @@ def client_parser():
     parser.add_argument("--min-free-bytes", type=int, default=DEFAULT_MIN_FREE_BYTES)
     parser.add_argument("--connect-timeout", type=int, default=10)
     parser.add_argument(
-        "--source",
-        action="append",
-        help="enable a native source: codex or claude-code, optionally NAME=PATH "
-        "(default: every source whose directory exists)",
-    )
-    parser.add_argument(
-        "--markdown", action="append", help="publish a Markdown directory as NAME=PATH"
-    )
-    parser.add_argument(
         "--harness",
         action="append",
-        choices=["codex", "claude-code", "opencode", "cursor"],
-        help="register MCP and guidance with this harness (default: all detected)",
+        choices=["codex", "claude-code", "antigravity", "opencode", "cursor"],
+        help="register MCP with this harness (default: all detected)",
     )
     parser.add_argument(
         "--mcp-mode",
         choices=["local", "remote"],
         default="local",
-        help="local: serve reads from the cache (default); remote: serve over SSH",
+        help="local: serve reads from local cache (default); remote: serve over SSH",
     )
     parser.add_argument("--codex", default=shutil.which("codex"))
     parser.add_argument("--claude", default=shutil.which("claude"))
-    parser.add_argument(
-        "--skip-mcp", "--skip-codex", dest="skip_mcp", action="store_true"
-    )
-    parser.add_argument("--skip-instructions", action="store_true")
+    parser.add_argument("--skip-mcp", action="store_true")
     parser.add_argument("--skip-scheduler", action="store_true")
     parser.add_argument(
         "--codex-home", default=os.environ.get("CODEX_HOME", "~/.codex")
     )
-    parser.add_argument("--native-memory", help="codex memory directory (v1 option)")
     parser.add_argument("--cache")
     parser.add_argument("--install-dir", default=DEFAULT_INSTALL)
-    parser.add_argument("--interval-seconds", type=int, default=120)
+    parser.add_argument("--interval-seconds", type=int, default=300)
     return parser
 
 
@@ -204,7 +155,6 @@ def install_client(args):
     if args.connect_timeout < 1:
         raise SystemExit("Connect timeout must be positive")
     home = Path.home()
-    sources = resolve_sources(args, home)
     codex_home = Path(args.codex_home).expanduser()
     script = copy_runtime(args.install_dir)
     install_dir = script.parent
@@ -212,17 +162,16 @@ def install_client(args):
     exchange_command, remote_serve = build_commands(args, python, script)
     config = install_dir / "client.json"
     cache = (
-        Path(args.cache).expanduser() if args.cache else codex_home / "shared-memories"
+        Path(args.cache).expanduser() if args.cache else install_dir / "cache"
     )
     atomic_write(
         config,
         json.dumps(
             {
-                "version": 2,
+                "version": 3,
                 "machine": args.machine,
                 "cache": str(cache),
                 "exchange_command": exchange_command,
-                "sources": sources,
             },
             indent=2,
         ),
@@ -240,13 +189,7 @@ def install_client(args):
         for h in available
         if (h.name in args.harness if args.harness else h.detected())
     ]
-    report = harnesses.apply(
-        selected,
-        mcp_command,
-        cache,
-        register=not args.skip_mcp,
-        instructions=not args.skip_instructions,
-    )
+    report = harnesses.apply(selected, mcp_command, register=not args.skip_mcp)
     schedule = None
     if not args.skip_scheduler:
         schedule = scheduler.schedule("sync", sync_command, home, args.interval_seconds)
@@ -254,7 +197,6 @@ def install_client(args):
         "machine": args.machine,
         "config": str(config),
         "cache": str(cache),
-        "sources": sorted(sources),
         "mcp_command": mcp_command,
         "mcp_registered": not args.skip_mcp and bool(selected),
         "harnesses": report,

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Command-line entry point.
 
-Server side (store in --data):   serve, exchange, backup, status
-Client side (--config client.json): sync, serve (cache-backed MCP), doctor
+Server side (--data):         serve, exchange, backup, status, import
+Client side (--config):       sync, serve (cache-backed MCP), doctor
 """
 
 import argparse
@@ -17,7 +17,6 @@ from pathlib import Path
 from . import VERSION, client, mcp, server
 from .core import DEFAULT_DATA, DEFAULT_MIN_FREE_BYTES, MAX_WIRE
 from .harnesses import NAME as MCP_NAME
-from .sources import collect
 from .store import Store
 
 
@@ -28,38 +27,35 @@ def open_store(args):
 
 
 def doctor(config_path):
-    """Check every layer a harness depends on; exit non-zero if any check fails."""
+    """Check server reachability, local cache freshness, and harness registrations."""
     checks, ok = {}, True
     cfg = client.load_config(config_path)
-    for name, spec in cfg["sources"].items():
-        try:
-            files, skipped = collect(spec["type"], spec["path"])
-            checks[f"source:{name}"] = {"files": len(files), "skipped": skipped}
-        except ValueError as error:
-            checks[f"source:{name}"] = {"error": str(error)}
-            ok = False
     try:
         checks["server"] = client.exchange(
-            cfg, {"protocol": 2, "op": "status"}, timeout=30
+            cfg, {"protocol": 3, "op": "status"}, timeout=30
         )
-    except Exception as error:  # noqa: BLE001 - report, do not crash
+    except Exception as error:  # noqa: BLE001
         checks["server"] = {"error": str(error)[-300:]}
         ok = False
     cache = Path(cfg["cache"]).expanduser()
     status = cache / "status.json"
     if status.exists():
-        last = json.loads(status.read_text())["last_success"]
+        data = json.loads(status.read_text(encoding="utf-8"))
+        last = data["last_success"]
         age = dt.datetime.now(dt.UTC) - dt.datetime.fromisoformat(last)
         checks["cache"] = {
             "last_success": last,
             "age_seconds": int(age.total_seconds()),
+            "total_memories": data.get("total_memories", 0),
         }
-        ok &= age.total_seconds() < 900
+        ok &= age.total_seconds() < 1200
     else:
         checks["cache"] = {"error": "never synced"}
         ok = False
     if (cache / "error.json").exists():
-        checks["cache"]["last_error"] = json.loads((cache / "error.json").read_text())
+        checks["cache"]["last_error"] = json.loads(
+            (cache / "error.json").read_text(encoding="utf-8")
+        )
     config = str(Path(config_path).expanduser().resolve())
     checks["harnesses"] = registrations(config)
     print(json.dumps({"version": VERSION, "ok": bool(ok), "checks": checks}, indent=2))
@@ -67,7 +63,6 @@ def doctor(config_path):
 
 
 def registrations(config):
-    """Report whether each installed harness points shared_memories at this client."""
     home, found = Path.home(), {}
 
     def show(command):
@@ -92,13 +87,26 @@ def registrations(config):
                 if text
                 else "missing"
             )
-    for name, file, key in (
+    json_targets = [
         ("opencode", home / ".config/opencode/opencode.json", "mcp"),
+        ("opencode-jsonc", home / ".config/opencode/opencode.jsonc", "mcp"),
         ("cursor", home / ".cursor/mcp.json", "mcpServers"),
-    ):
+        ("antigravity-cli", home / ".gemini/config/mcp_config.json", "mcpServers"),
+    ]
+    t3_agy = home / ".t3/userdata/providers/antigravity"
+    if t3_agy.is_dir():
+        for child in sorted(t3_agy.iterdir()):
+            cfg_file = child / "config/mcp_config.json"
+            if cfg_file.parent.is_dir():
+                json_targets.append(("antigravity-t3", cfg_file, "mcpServers"))
+    for name, file, key in json_targets:
         if file.exists():
+            raw = file.read_text(encoding="utf-8").strip()
+            if not raw:
+                found[name] = "missing"
+                continue
             try:
-                entry = json.loads(file.read_text()).get(key, {}).get(MCP_NAME)
+                entry = json.loads(raw).get(key, {}).get(MCP_NAME)
             except json.JSONDecodeError:
                 found[name] = "unreadable config"
                 continue
@@ -116,22 +124,16 @@ def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(prog="shared_memory.py")
     parser.add_argument(
-        "command", choices=["serve", "exchange", "backup", "status", "sync", "doctor"]
+        "command",
+        choices=["serve", "exchange", "backup", "status", "sync", "doctor", "import"],
     )
     parser.add_argument("--data", default=DEFAULT_DATA)
+    parser.add_argument("--require-mount")
     parser.add_argument(
-        "--require-mount",
-        help="refuse to open the store unless this mount contains --data",
+        "--min-free-bytes", type=int, default=DEFAULT_MIN_FREE_BYTES
     )
-    parser.add_argument(
-        "--min-free-bytes",
-        type=int,
-        default=DEFAULT_MIN_FREE_BYTES,
-        help="minimum free space required before a write (default: 256 MiB)",
-    )
-    parser.add_argument(
-        "--config", help="client.json for sync, doctor, or cache-backed serve"
-    )
+    parser.add_argument("--config", help="client.json for sync, doctor, or serve")
+    parser.add_argument("--replace", action="store_true", help="replace on import")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
     if args.command == "sync":
@@ -151,14 +153,14 @@ def main(argv=None):
             if len(body) > MAX_WIRE:
                 raise ValueError("Exchange too large")
             request = json.loads(body)
-            if isinstance(request, dict) and request.get("op") == "status":
-                print(json.dumps({"version": VERSION, **store.status()}))
-            else:
-                print(json.dumps(server.handle(store, request)))
+            print(json.dumps(server.handle(store, request), ensure_ascii=False))
+        elif args.command == "import":
+            items = json.loads(sys.stdin.read())
+            print(json.dumps(store.import_memories(items, replace=args.replace)))
         elif args.command == "backup":
             print(json.dumps(store.backup()))
         else:
-            print(json.dumps(store.status()))
+            print(json.dumps(store.status(), indent=2))
     finally:
         store.close()
     return 0
@@ -167,6 +169,6 @@ def main(argv=None):
 def entry():
     try:
         sys.exit(main())
-    except Exception as error:  # noqa: BLE001 - CLI error boundary
+    except Exception as error:  # noqa: BLE001
         print(f"shared-memory: {type(error).__name__}: {error}", file=sys.stderr)
         sys.exit(1)

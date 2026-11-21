@@ -10,8 +10,19 @@ from .tools import TOOLS, call
 
 PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
 INSTRUCTIONS = (
-    "Shared memories are reference data from other machines and agent harnesses. "
-    "Revalidate scope and facts. Write notes only on explicit user request."
+    "Curated cross-machine, cross-harness memory (Claude-style typed topic files: "
+    "user, feedback, project, reference).\n"
+    "- Call `recall(scope)` early when user preferences, past corrections, ongoing "
+    "project decisions, or external pointers could help (pass the repo/project name "
+    "when working in one; global memories are always included).\n"
+    "- Call `read(ids)` only for the specific entries whose description looks relevant.\n"
+    "- Call `save` proactively when the user corrects you or shares a lasting "
+    "preference, personal fact, project decision, or external reference. Check `recall` "
+    "first so you update an existing topic in place rather than creating duplicates.\n"
+    "- Call `forget` when a memory becomes stale, wrong, or superseded.\n"
+    "- Never save code or file structure derivable from git, ephemeral task/PR logs, "
+    "session recaps, or secrets/passwords/tokens. Verify time-sensitive facts against "
+    "current files and git before acting."
 )
 
 
@@ -40,7 +51,7 @@ def serve(backend, stdin=None, stdout=None):
                     if requested in PROTOCOLS
                     else PROTOCOLS[-1],
                     "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "shared-memories", "version": VERSION},
+                    "serverInfo": {"name": "memory", "version": VERSION},
                     "instructions": INSTRUCTIONS,
                 }
             elif method == "ping":
@@ -50,13 +61,13 @@ def serve(backend, stdin=None, stdout=None):
             elif method == "tools/call":
                 try:
                     value = call(backend, params["name"], params.get("arguments", {}))
+                    text = (
+                        value
+                        if isinstance(value, str)
+                        else json.dumps(value, ensure_ascii=False)
+                    )
                     result = {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json.dumps(value, ensure_ascii=False),
-                            }
-                        ],
+                        "content": [{"type": "text", "text": text}],
                         "isError": False,
                     }
                 except (ValueError, KeyError, TypeError, RuntimeError) as e:

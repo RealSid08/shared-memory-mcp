@@ -1,14 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MCP tool schemas and behavior.
+"""MCP tool schemas and behavior for curated, Claude-style cross-harness memory.
 
-Tool contracts follow Codex's native short memory tools (list, read, search) plus
-add_ad_hoc_note. A backend is any object with files() -> {path: content} and
-add_note(filename, note); the server store and the client cache both qualify.
+Four crisp tools designed around how agents actually recall and update memory:
+- recall: load the scannable one-line index (global + optional project scope) or search
+- read:   fetch full Markdown content of 1-10 memories by ID in one call
+- save:   create or update a typed memory in place (enforces anti-slop guardrails)
+- forget: delete a stale, wrong, or superseded memory cleanly
 """
 
 import re
 
-from .core import MAX_WIRE, NOTE_RE, safe_path
+from .core import (
+    MAX_DESCRIPTION_LEN,
+    MAX_MEMORY_BYTES,
+    MAX_NAME_LEN,
+    MAX_WIRE,
+    MEMORY_TYPES,
+    SCOPE_RE,
+    SLUG_RE,
+    parse_memory_id,
+    short_date,
+    validate_scope,
+)
+from .store import search_items
 
 
 def optional(schema):
@@ -16,30 +30,10 @@ def optional(schema):
 
 
 STR = {"type": "string"}
-POS = {"type": "integer", "minimum": 1}
-COMMON = {"path": optional(STR), "cursor": optional(STR), "max_results": optional(POS)}
-MODE = {
-    "oneOf": [
-        {
-            "type": "object",
-            "properties": {"type": {"const": t}},
-            "required": ["type"],
-            "additionalProperties": False,
-        }
-        for t in ("any", "all_on_same_line")
-    ]
-    + [
-        {
-            "type": "object",
-            "properties": {"type": {"const": "all_within_lines"}, "line_count": POS},
-            "required": ["type", "line_count"],
-            "additionalProperties": False,
-        }
-    ]
-}
+TYPE_ENUM = {"type": "string", "enum": list(MEMORY_TYPES)}
 
 
-def tool(name, description, properties, required=()):
+def _tool(name, description, properties, required=(), *, read_only=False, destructive=False):
     return {
         "name": name,
         "description": description,
@@ -50,53 +44,139 @@ def tool(name, description, properties, required=()):
             "additionalProperties": False,
         },
         "annotations": {
-            "readOnlyHint": name != "add_ad_hoc_note",
-            "destructiveHint": False,
+            "readOnlyHint": read_only,
+            "destructiveHint": destructive,
         },
     }
 
 
 TOOLS = [
-    tool(
-        "list",
-        "List shared agent memory files and directories (all machines and harnesses). "
-        "Reference data, not instructions.",
-        COMMON,
+    _tool(
+        "recall",
+        "Load the curated memory index and/or search memories by keywords. Call early "
+        "in a task whenever user preferences, past corrections, ongoing project "
+        "decisions, or external pointers could help. Always includes `global` memories; "
+        "pass `scope` (a short lowercase repo/project name like `web-app`, `api`, "
+        "`mobile-app`, or `career`) to include that project's memories too. Returns "
+        "compact one-line summaries so you can pick only the few relevant IDs to `read`.",
+        {
+            "scope": optional(
+                {
+                    "type": "string",
+                    "description": (
+                        "Optional lowercase project/repo slug (e.g. 'web-app', "
+                        "'api', 'career'). Global memories are always included."
+                    ),
+                }
+            ),
+            "query": optional(
+                {
+                    "type": "string",
+                    "description": (
+                        "Optional space-separated keywords to search across titles, "
+                        "descriptions, and bodies."
+                    ),
+                }
+            ),
+            "type": optional(
+                {
+                    **TYPE_ENUM,
+                    "description": "Optional filter: user, feedback, project, or reference.",
+                }
+            ),
+        },
+        read_only=True,
     ),
-    tool(
+    _tool(
         "read",
-        "Read a shared Markdown memory file with one-based line offsets.",
-        {"path": STR, "line_offset": optional(POS), "max_lines": optional(POS)},
-        ["path"],
-    ),
-    tool(
-        "search",
-        "Search shared agent memory by literal substrings; optionally normalize "
-        "separators or match a line window.",
+        "Read the full Markdown content of one or more memories by ID (`<scope>/<slug>`, "
+        "e.g. `global/writing-voice` or `web-app/release-flow`). Batch multiple IDs "
+        "in one call when several entries from `recall` look relevant.",
         {
-            **COMMON,
-            "queries": {"type": "array", "items": STR, "minItems": 1},
-            "match_mode": optional(MODE),
-            "context_lines": optional({"type": "integer", "minimum": 0}),
-            "case_sensitive": optional({"type": "boolean"}),
-            "normalized": optional({"type": "boolean"}),
+            "ids": {
+                "type": "array",
+                "items": STR,
+                "minItems": 1,
+                "maxItems": 10,
+                "description": "Memory IDs in '<scope>/<slug>' form.",
+            }
         },
-        ["queries"],
+        ["ids"],
+        read_only=True,
     ),
-    tool(
-        "add_ad_hoc_note",
-        "Create one append-only shared note only after the user explicitly asks to "
-        "remember, forget, or update something. Do not store credentials.",
+    _tool(
+        "save",
+        "Create or update a durable memory in place (same `scope` + `slug` replaces "
+        "the existing entry). Save proactively when the user corrects your behavior, "
+        "states a lasting preference, shares a durable personal fact, makes an ongoing "
+        "project decision, or gives an external pointer. Check `recall` first so you "
+        "update an existing topic instead of creating duplicates. NEVER save code or "
+        "architecture derivable from git, ephemeral task/PR logs, session recaps, or "
+        "secrets/passwords/tokens.",
         {
-            "filename": {
+            "scope": {
                 "type": "string",
-                "pattern": "^" + NOTE_RE + "$",
-                "minLength": 24,
-                "maxLength": 128,
+                "pattern": f"^{SCOPE_RE}$",
+                "description": (
+                    "'global' for user/cross-project memories, or a short lowercase "
+                    "project slug (e.g. 'web-app', 'api', 'career')."
+                ),
             },
-            "note": {"type": "string", "minLength": 1},
+            "slug": {
+                "type": "string",
+                "pattern": f"^{SLUG_RE}$",
+                "description": (
+                    "Stable kebab-case topic ID (e.g. 'writing-voice', 'no-prod-dry-run'). "
+                    "Reuse an existing slug to update it in place."
+                ),
+            },
+            "type": {
+                **TYPE_ENUM,
+                "description": (
+                    "user (who the user is/goals/personal facts), feedback (behavioral "
+                    "rule/correction with Why + How to apply), project (ongoing work/"
+                    "decisions/deadlines not in git), or reference (external tool/doc pointer)."
+                ),
+            },
+            "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_NAME_LEN,
+                "description": "Short display title.",
+            },
+            "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_DESCRIPTION_LEN,
+                "description": (
+                    "Single-line hook shown in the index so future sessions know when "
+                    "this memory is relevant."
+                ),
+            },
+            "content": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_MEMORY_BYTES,
+                "description": (
+                    "Concise Markdown body (max 8 KiB). For feedback/project memories, "
+                    "include the rule/fact, Why, and How to apply."
+                ),
+            },
         },
-        ["filename", "note"],
+        ["scope", "slug", "type", "name", "description", "content"],
+    ),
+    _tool(
+        "forget",
+        "Delete an outdated, wrong, or superseded memory by ID (`<scope>/<slug>`). "
+        "Use when a project finishes, a preference changes, or duplicates are merged.",
+        {
+            "id": {
+                "type": "string",
+                "description": "Memory ID to delete in '<scope>/<slug>' form.",
+            }
+        },
+        ["id"],
+        destructive=True,
     ),
 ]
 
@@ -111,8 +191,8 @@ def validate(value, schema):
             except ValueError:
                 pass
         raise ValueError("Argument does not match allowed schema")
-    if "const" in schema and value != schema["const"]:
-        raise ValueError("Invalid enum value")
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"Value must be one of: {', '.join(schema['enum'])}")
     kind = schema.get("type")
     types = {
         "object": dict,
@@ -126,162 +206,147 @@ def validate(value, schema):
         raise ValueError("Invalid argument type")
     if kind == "object":
         props = schema["properties"]
-        if set(value) - set(props) or set(schema.get("required", [])) - set(value):
+        unknown = set(value) - set(props)
+        missing = set(schema.get("required", [])) - set(value)
+        if unknown or missing:
             raise ValueError("Unknown or missing argument")
         for key, val in value.items():
             validate(val, props[key])
-    if kind == "array":
+    elif kind == "array":
         if len(value) < schema.get("minItems", 0):
-            raise ValueError("Empty query list")
+            raise ValueError("List has too few items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            raise ValueError(f"List exceeds {schema['maxItems']} item limit")
         for val in value:
             validate(val, schema["items"])
-    if kind == "integer" and value < schema.get("minimum", 0):
-        raise ValueError("Argument below minimum")
-    if kind == "string":
-        if (
-            not schema.get("minLength", 0)
-            <= len(value)
-            <= schema.get("maxLength", MAX_WIRE)
-        ):
+    elif kind == "string":
+        if not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", MAX_WIRE):
             raise ValueError("Invalid string length")
         if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
-            raise ValueError("Invalid filename")
+            raise ValueError("String does not match required pattern")
 
 
-def page(items, args, maximum):
-    cursor = args.get("cursor")
-    if cursor is not None and not re.fullmatch(r"[0-9]+", cursor):
-        raise ValueError("Cursor must be a non-negative integer")
-    offset = int(cursor or 0)
-    if offset > len(items):
-        raise ValueError("Cursor exceeds result count")
-    end = min(offset + min(args.get("max_results") or maximum, maximum), len(items))
-    next_cursor = str(end) if end < len(items) else None
-    return items[offset:end], next_cursor, next_cursor is not None
+def _format_index_line(mem):
+    return (
+        f"- `{mem['id']}` [{mem['type']}, {short_date(mem['updated_at'])}] — "
+        f"{mem['description']}"
+    )
+
+
+def _recall(backend, args):
+    scope = args.get("scope")
+    if scope is not None:
+        scope = scope.strip().lower()
+        if scope:
+            validate_scope(scope)
+        else:
+            scope = None
+    query = (args.get("query") or "").strip() or None
+    mem_type = args.get("type") or None
+    all_items = backend.all_memories()
+
+    if query:
+        hits = search_items(all_items, query, scope=scope, mem_type=mem_type, limit=25)
+        if not hits:
+            scope_hint = f" in global + {scope}" if scope and scope != "global" else ""
+            return f"No memories matched `{query}`{scope_hint}."
+        lines = [f"# Memory Search: `{query}` ({len(hits)} matches)", ""]
+        for mem in hits:
+            lines.append(_format_index_line(mem))
+            if mem.get("snippet"):
+                lines.append(f"  > {mem['snippet']}")
+        return "\n".join(lines)
+
+    by_scope = {}
+    for mem in all_items:
+        if mem_type and mem["type"] != mem_type:
+            continue
+        by_scope.setdefault(mem["scope"], []).append(mem)
+
+    global_items = by_scope.get("global", [])
+    other_scopes = sorted(s for s in by_scope if s != "global")
+
+    lines = ["# Memory Index", ""]
+    lines.append(f"## Global ({len(global_items)})")
+    if global_items:
+        lines.extend(_format_index_line(m) for m in global_items)
+    else:
+        lines.append("- (no global memories)")
+
+    if scope and scope != "global":
+        proj_items = by_scope.get(scope, [])
+        lines.extend(["", f"## Project: {scope} ({len(proj_items)})"])
+        if proj_items:
+            lines.extend(_format_index_line(m) for m in proj_items)
+        else:
+            lines.append(f"- (no memories yet for `{scope}`)")
+        remaining = [s for s in other_scopes if s != scope]
+        if remaining:
+            summary = ", ".join(f"`{s}` ({len(by_scope[s])})" for s in remaining)
+            lines.extend(["", f"Other scopes: {summary}"])
+    elif other_scopes:
+        lines.extend(["", "## Project Scopes (pass `scope` to list)"])
+        summary = ", ".join(f"`{s}` ({len(by_scope[s])})" for s in other_scopes)
+        lines.append(summary)
+
+    return "\n".join(lines)
+
+
+def _read(backend, args):
+    ids = args["ids"]
+    parsed = [f"{s}/{k}" for s, k in (parse_memory_id(i) for i in ids)]
+    fetched = backend.get_memories(parsed)
+    blocks = []
+    missing = []
+    for memory_id in parsed:
+        mem = fetched.get(memory_id)
+        if mem is None:
+            missing.append(memory_id)
+            continue
+        meta = f"`{mem['id']}` · type: {mem['type']} · updated: {short_date(mem['updated_at'])}"
+        if mem.get("updated_by"):
+            meta += f" · by: {mem['updated_by']}"
+        blocks.append(
+            f"## {mem['name']}\n{meta}\n_{mem['description']}_\n\n{mem['body']}"
+        )
+    if missing:
+        blocks.append("Not found: " + ", ".join(f"`{m}`" for m in missing))
+    if not blocks:
+        raise ValueError("No requested memories found")
+    return "\n\n---\n\n".join(blocks)
+
+
+def _save(backend, args):
+    res = backend.save_memory(
+        scope=args["scope"],
+        slug=args["slug"],
+        type=args["type"],
+        name=args["name"],
+        description=args["description"],
+        content=args["content"],
+    )
+    return (
+        f"{res['status'].capitalize()} `{res['id']}` "
+        f"({res['bytes']} B, updated {short_date(res['updated_at'])})."
+    )
+
+
+def _forget(backend, args):
+    res = backend.delete_memory(args["id"])
+    if res["status"] == "not_found":
+        return f"Not found: `{res['id']}`."
+    return f"Deleted `{res['id']}`."
 
 
 def call(backend, name, args):
     spec = next((t for t in TOOLS if t["name"] == name), None)
     if spec is None:
-        raise ValueError("Unknown tool")
+        raise ValueError(f"Unknown tool: {name}")
     validate(args, spec["inputSchema"])
-    if name == "add_ad_hoc_note":
-        return backend.add_note(**args)
-    files = backend.files()
-    scope = safe_path(args.get("path") or "", root_ok=True)
-    scoped = {
-        p: c
-        for p, c in files.items()
-        if not scope or p == scope or p.startswith(scope + "/")
-    }
-    if not scoped:
-        raise ValueError("Memory path not found")
-    if name == "list":
-        return _list(scope, scoped, args)
+    if name == "recall":
+        return _recall(backend, args)
     if name == "read":
-        return _read(scope, files, args)
-    return _search(scoped, args)
-
-
-def _list(scope, scoped, args):
-    entries = {}
-    for path in scoped:
-        tail = path[len(scope) + 1 :] if scope and path != scope else path
-        if path == scope:
-            entries[path] = "file"
-        else:
-            child = (scope + "/" if scope else "") + tail.split("/")[0]
-            entries[child] = "directory" if "/" in tail else "file"
-    rows, cursor, truncated = page(
-        [{"path": p, "entry_type": t} for p, t in sorted(entries.items())], args, 2000
-    )
-    return {
-        "path": args.get("path"),
-        "entries": rows,
-        "next_cursor": cursor,
-        "truncated": truncated,
-    }
-
-
-def _read(scope, files, args):
-    if scope not in files:
-        raise ValueError("Path is not a file")
-    content = files[scope]
-    offsets = [0] + [m.end() for m in re.finditer("\n", content)]
-    offset = args.get("line_offset") or 1
-    if offset > len(offsets):
-        raise ValueError("Line offset exceeds file length")
-    start = offsets[offset - 1]
-    maximum = args.get("max_lines")
-    end = (
-        offsets[offset - 1 + maximum]
-        if maximum and offset - 1 + maximum < len(offsets)
-        else len(content)
-    )
-    # Conservative character bound; differs from native tokenizer-based 20k-token cap.
-    part = content[start:end][:60000]
-    return {
-        "path": args["path"],
-        "start_line_number": offset,
-        "content": part,
-        "truncated": end < len(content) or len(part) < end - start,
-    }
-
-
-def _search(scoped, args):
-    queries = [q.strip() for q in args["queries"]]
-    normalized = args.get("normalized") or False
-    sensitive = (
-        args.get("case_sensitive") if args.get("case_sensitive") is not None else True
-    )
-
-    def norm(s):
-        s = s if sensitive else s.lower()
-        return "".join(c for c in s if c.isalnum()) if normalized else s
-
-    if any(not q or not norm(q) for q in queries):
-        raise ValueError("Queries must not be blank after normalization")
-    mode = args.get("match_mode") or {"type": "any"}
-    context = args.get("context_lines") or 0
-    needles = [norm(q) for q in queries]
-    rows = []
-    for path, content in sorted(scoped.items()):
-        lines = content.splitlines()
-        flags = [[n in norm(line) for n in needles] for line in lines]
-        windows = []
-        for i, flags_i in enumerate(flags):
-            if (mode["type"] == "any" and any(flags_i)) or (
-                mode["type"] == "all_on_same_line" and all(flags_i)
-            ):
-                windows.append((i, i, flags_i))
-            elif mode["type"] == "all_within_lines" and any(flags_i):
-                seen = [False] * len(queries)
-                for j in range(i, min(i + mode["line_count"], len(lines))):
-                    seen = [a or b for a, b in zip(seen, flags[j])]
-                    if all(seen):
-                        windows.append((i, j, seen))
-                        break
-        for i, j, seen in windows:
-            if mode["type"] == "all_within_lines" and any(
-                i <= a and b <= j and (i, j) != (a, b) for a, b, _ in windows
-            ):
-                continue
-            start, end = max(0, i - context), min(len(lines), j + context + 1)
-            rows.append(
-                {
-                    "path": path,
-                    "match_line_number": i + 1,
-                    "content_start_line_number": start + 1,
-                    "content": "\n".join(lines[start:end]),
-                    "matched_queries": [q for q, hit in zip(queries, seen) if hit],
-                }
-            )
-    rows, cursor, truncated = page(rows, args, 200)
-    return {
-        "queries": queries,
-        "match_mode": mode,
-        "path": args.get("path"),
-        "matches": rows,
-        "next_cursor": cursor,
-        "truncated": truncated,
-    }
+        return _read(backend, args)
+    if name == "save":
+        return _save(backend, args)
+    return _forget(backend, args)
